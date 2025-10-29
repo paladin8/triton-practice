@@ -1,0 +1,33 @@
+[project]
+name = "triton-practice"
+version = "0.1.0"
+description = "Practice implementing GPU kernels in Triton."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "torch",
+    "triton",
+]
+
+[tool.uv]
+package = true
+dev-dependencies = [
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["A", "ANN", "B", "C4", "E", "F", "FA", "I", "Q", "SIM", "TCH", "UP", "W", "YTT"]
+ignore = ["E731"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["triton_practice"]
