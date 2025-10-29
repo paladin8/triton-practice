@@ -20,10 +20,10 @@ def torch_matrix_add(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         # Stages (typically 2-4): more stages allow for more overlapping of memory traffic with compute, but at the cost
         # of more SHMEM/register usage.
         # Warps (typically 2, 4, 8): more warps can increase occupancy, but at the cost of more SHMEM/register usage.
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_stages=2, num_warps=8),
     ],
     key=["M", "N"],
 )
@@ -113,7 +113,7 @@ def triton_matrix_add_2d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         # Warps (typically 2, 4, 8): more warps can increase occupancy, but at the cost of more SHMEM/register usage.
         triton.Config({"BLOCK_SIZE": 1024}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_SIZE": 1024}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_SIZE": 2048}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 4096}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_SIZE": 4096}, num_stages=2, num_warps=8),
     ],
     key=["N_ELEMS"],
@@ -181,7 +181,9 @@ def test() -> None:
         C_triton_1d = triton_matrix_add_1d(A, B)
         assert torch.allclose(C_torch, C_triton_2d), f"Test failure: mismatch for size {size}"
         assert torch.allclose(C_torch, C_triton_1d), f"Test failure: mismatch for size {size}"
-    print("All tests passed!")
+    print("=========================")
+    print("=== All tests passed! ===")
+    print("=========================")
 
 
 @triton.testing.perf_report(
@@ -212,14 +214,14 @@ def benchmark(size: int, provider: Literal["torch", "triton2d", "triton1d"]) -> 
 
 
 def main() -> None:
+    # Enable Triton autotuning logging.
+    import os
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
     print("Running matrix_add benchmark on device:", DEVICE)
 
     # Run a simple correctness test first.
     test()
-
-    # Enable Triton autotuning logging.
-    import os
-    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
     # Run the benchmark.
     benchmark.run(print_data=True)
@@ -228,17 +230,18 @@ def main() -> None:
     #
     # matrix-add-performance:
     #       size       Torch  Triton (2-D)  Triton (1-D)
-    # 0    512.0  371.374022    253.894448    376.019075
-    # 1   1024.0  707.538234    338.729666    794.802634
-    # 2   2048.0  722.945204    379.345660    774.600399
-    # 3   4096.0  819.801079    392.628824    809.641158
-    # 4   8192.0  845.977783    399.754695    806.559803
-    # 5  16384.0  820.139626    406.292674    852.866883
+    # 0    512.0  371.408985    289.331248    362.659802
+    # 1   1024.0  714.219807    388.032560    710.301425
+    # 2   2048.0  783.232646    485.896088    778.138171
+    # 3   4096.0  817.348086    553.718493    803.120682
+    # 4   8192.0  812.700535    615.967132    848.483353
+    # 5  16384.0  839.159456    623.336654    852.714630
     #
     # The 1-D version performs better than the 2-D version because it assumes the input is contiguous in memory, which
     # is true for the matrices here. In the 1-D kernel, the memory access patterns are better coalesced under this
     # assumption (traverses the memory block fully sequentially instead of "jumping" to handle tiles across multiple
-    # rows). The 2-D kernel deals with arbitrary strides, which makes it less efficient but more general.
+    # rows). The 2-D kernel deals with arbitrary strides and puts pressure on registers while computing all of the
+    # offsets, which makes it less efficient but more general.
 
 
 if __name__ == "__main__":
