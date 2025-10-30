@@ -1,3 +1,7 @@
+"""
+Kernels for adding two matrices.
+"""
+
 from typing import Literal, cast
 
 import torch
@@ -11,6 +15,9 @@ from triton_practice.utils.device import DEVICE
 def torch_matrix_add(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     assert A.shape == B.shape, "Input tensors must have the same shape"
     return A + B
+
+
+torch_compile_matrix_add = torch.compile(torch_matrix_add)
 
 
 # Each run of this kernel is responsible for a [BLOCK_M, BLOCK_N] tile of the output matrix C.
@@ -43,9 +50,9 @@ def _matrix_add_kernel_2d(
     BLOCK_M: tl.constexpr,  # number of rows in each block
     BLOCK_N: tl.constexpr,  # number of columns in each block
 ) -> None:
-    # Identify which point in the grid this kernel instance is responsible for.
-    pid_m = tl.program_id(axis=0)  # program ID in the first dimension of the grid
-    pid_n = tl.program_id(axis=1)  # program ID in the second dimension of the grid
+    # Identify which block in the grid this kernel instance is responsible for.
+    pid_m = tl.program_id(axis=1)  # program ID in the second dimension of the grid
+    pid_n = tl.program_id(axis=0)  # program ID in the first dimension of the grid
 
     # Construct the 1-D ranges of row and column offsets for this block.
     offsets_m = pid_m * BLOCK_M + tl.arange(start=0, end=BLOCK_M)  # [BLOCK_M] range of row offsets for this block
@@ -56,9 +63,9 @@ def _matrix_add_kernel_2d(
     # The [BLOCK_N] range offs_n is repeated for BLOCK_M rows to turn into a [BLOCK_M, BLOCK_N] array of column offsets.
     # We multiply the row and column offsets by their respective strides to get the final 2-D offsets into the 1-D
     # representations of the matrices.
-    A_offsets = offsets_m[:, None] * stride_am + offsets_n[None, :] * stride_an  # 2-D offsets for A
-    B_offsets = offsets_m[:, None] * stride_bm + offsets_n[None, :] * stride_bn  # 2-D offsets for B
-    C_offsets = offsets_m[:, None] * stride_cm + offsets_n[None, :] * stride_cn  # 2-D offsets for C
+    A_offsets = offsets_m[:, None] * stride_am + offsets_n[None, :] * stride_an  # [BLOCK_M, BLOCK_N] offsets for A
+    B_offsets = offsets_m[:, None] * stride_bm + offsets_n[None, :] * stride_bn  # [BLOCK_M, BLOCK_N] offsets for B
+    C_offsets = offsets_m[:, None] * stride_cm + offsets_n[None, :] * stride_cn  # [BLOCK_M, BLOCK_N] offsets for C
 
     # Compute the mask for handling elements within bounds. This matters when M/N are not multiples of BLOCK_M/BLOCK_N.
     # This mask is a [BLOCK_M, BLOCK_N] array where each element is True if the row and column offset is within [M, N].
@@ -84,7 +91,9 @@ def triton_matrix_add_2d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     C = torch.empty_like(A)  # Empty [M, N] output matrix
 
     # Create 2-D grid that launches one kernel instance per [BLOCK_M, BLOCK_N] tile of the output matrix C.
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+    # Note that we swap the order of M and N here because that leads to better memory access patterns given Triton's
+    # scheduling (the earlier dimension increments first, so we want that to be the columns for a row-major tensor).
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(M, META["BLOCK_M"]))
 
     # Launch the kernel with the grid.
     _matrix_add_kernel_2d[grid](
@@ -126,7 +135,7 @@ def _matrix_add_kernel_1d(
     N_ELEMS: int,  # number of elements in A, B, and C
     BLOCK_SIZE: tl.constexpr,  # number of elements in each block
 ) -> None:
-    # Identify which point in the grid this kernel instance is responsible for.
+    # Identify which block in the grid this kernel instance is responsible for.
     pid = tl.program_id(axis=0)  # program ID in the grid
 
     # Construct the 1-D range of offsets for this block.
@@ -135,15 +144,15 @@ def _matrix_add_kernel_1d(
     # Compute the mask for handling elements within bounds. This matters when N_ELEMS is not a multiple of BLOCK_SIZE.
     mask = offsets < N_ELEMS  # [BLOCK_SIZE] mask
 
-    # Load the [BLOCK_SIZE] blocks from A and B, applying the mask and using 0.0 for out-of-bounds elements.
-    A_block = tl.load(pointer=A_ptr + offsets, mask=mask, other=0.0)  # masked [BLOCK_SIZE] block from A
-    B_block = tl.load(pointer=B_ptr + offsets, mask=mask, other=0.0)  # masked [BLOCK_SIZE] block from B
+    # Load the [BLOCK_SIZE] tiles from A and B, applying the mask and using 0.0 for out-of-bounds elements.
+    A_tile = tl.load(pointer=A_ptr + offsets, mask=mask, other=0.0)  # masked [BLOCK_SIZE] tile from A
+    B_tile = tl.load(pointer=B_ptr + offsets, mask=mask, other=0.0)  # masked [BLOCK_SIZE] tile from B
 
     # Perform the computation. This just represents the addition and does not allocate intermediate memory.
-    C_block = A_block + B_block  # [BLOCK_SIZE] block of C
+    C_tile = A_tile + B_tile  # [BLOCK_SIZE] tile of C
 
-    # Store the result block back to C, applying the mask to avoid out-of-bounds writes.
-    tl.store(pointer=C_ptr + offsets, value=C_block, mask=mask)
+    # Store the result tile back to C, applying the mask to avoid out-of-bounds writes.
+    tl.store(pointer=C_ptr + offsets, value=C_tile, mask=mask)
 
 
 def triton_matrix_add_1d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -172,15 +181,19 @@ def triton_matrix_add_1d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 def test() -> None:
-    sizes = [128, 256, 512, 1024]
-    for size in sizes:
-        A = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
-        B = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
-        C_torch = torch_matrix_add(A, B)
-        C_triton_2d = triton_matrix_add_2d(A, B)
-        C_triton_1d = triton_matrix_add_1d(A, B)
-        assert torch.allclose(C_torch, C_triton_2d), f"Test failure: mismatch for size {size}"
-        assert torch.allclose(C_torch, C_triton_1d), f"Test failure: mismatch for size {size}"
+    sizes = [64, 256, 1024, 4096, 16384]
+    for base_size in sizes:
+        for delta in [-1, 0, 1]:
+            size = base_size + delta
+            A = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
+            B = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
+            C_torch = torch_matrix_add(A, B)
+            C_torch_compile = torch_compile_matrix_add(A, B)
+            C_triton_2d = triton_matrix_add_2d(A, B)
+            C_triton_1d = triton_matrix_add_1d(A, B)
+            assert torch.allclose(C_torch, C_torch_compile), f"Test failure: mismatch for size {size}"
+            assert torch.allclose(C_torch, C_triton_2d), f"Test failure: mismatch for size {size}"
+            assert torch.allclose(C_torch, C_triton_1d), f"Test failure: mismatch for size {size}"
     print("=========================")
     print("=== All tests passed! ===")
     print("=========================")
@@ -192,21 +205,23 @@ def test() -> None:
         x_vals=[2**i for i in range(9, 15)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=["torch", "triton2d", "triton1d"],  # Possible values for `line_arg`.
-        line_names=["Torch", "Triton (2-D)", "Triton (1-D)"],  # Label name for the lines.
+        line_vals=["torch", "torch_compile", "triton_2d", "triton_1d"],  # Possible values for `line_arg`.
+        line_names=["Torch", "Torch (Compile)", "Triton (2-D)", "Triton (1-D)"],  # Label name for the lines.
         ylabel="GB/s",  # Label name for the y-axis.
         plot_name="matrix-add-performance",  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ),
 )
-def benchmark(size: int, provider: Literal["torch", "triton2d", "triton1d"]) -> float:
+def benchmark(size: int, provider: Literal["torch", "torch_compile", "triton_2d", "triton_1d"]) -> float:
     A = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
     B = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
     if provider == "torch":
         ms = cast("float", triton.testing.do_bench(fn=lambda: torch_matrix_add(A, B)))
-    elif provider == "triton2d":
+    elif provider == "torch_compile":
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_matrix_add(A, B)))
+    elif provider == "triton_2d":
         ms = cast("float", triton.testing.do_bench(fn=lambda: triton_matrix_add_2d(A, B)))
-    elif provider == "triton1d":
+    elif provider == "triton_1d":
         ms = cast("float", triton.testing.do_bench(fn=lambda: triton_matrix_add_1d(A, B)))
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -229,19 +244,21 @@ def main() -> None:
     # Results on an RTX 5080.
     #
     # matrix-add-performance:
-    #       size       Torch  Triton (2-D)  Triton (1-D)
-    # 0    512.0  371.408985    289.331248    362.659802
-    # 1   1024.0  714.219807    388.032560    710.301425
-    # 2   2048.0  783.232646    485.896088    778.138171
-    # 3   4096.0  817.348086    553.718493    803.120682
-    # 4   8192.0  812.700535    615.967132    848.483353
-    # 5  16384.0  839.159456    623.336654    852.714630
+    #       size       Torch  Torch (Compile)  Triton (2-D)  Triton (1-D)
+    # 0    512.0  367.513617       374.146592    308.325120    369.518963
+    # 1   1024.0  761.380278       727.048281    547.228265    762.127317
+    # 2   2048.0  791.098677       769.073548    687.370800    805.062863
+    # 3   4096.0  834.166022       828.185039    787.079440    834.096885
+    # 4   8192.0  838.430058       845.383286    839.153454    846.825608
+    # 5  16384.0  840.250419       851.773144    863.638834    847.571065
     #
     # The 1-D version performs better than the 2-D version because it assumes the input is contiguous in memory, which
     # is true for the matrices here. In the 1-D kernel, the memory access patterns are better coalesced under this
     # assumption (traverses the memory block fully sequentially instead of "jumping" to handle tiles across multiple
     # rows). The 2-D kernel deals with arbitrary strides and puts pressure on registers while computing all of the
-    # offsets, which makes it less efficient but more general.
+    # offsets, which makes it slightly less efficient but more general.
+    #
+    # Unsurprisingly, torch compilation doesn't make much of a difference here since the operation is so simple.
 
 
 if __name__ == "__main__":
