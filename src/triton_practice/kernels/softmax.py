@@ -123,13 +123,14 @@ def test() -> None:
             size = base_size + delta
             scale = 1.0 + (size % 10) * 0.1  # vary scale for each size
             X = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
-            Y_torch_native = torch_native_softmax(X, scale)
-            Y_torch = torch_softmax(X, scale)
-            Y_torch_compile = torch_compile_softmax(X, scale)
-            Y_triton = triton_softmax(X, scale)
+            Y_torch_native = torch_native_softmax(X, scale=scale)
+            Y_torch = torch_softmax(X, scale=scale)
+            Y_torch_compile = torch_compile_softmax(X, scale=scale)
+            Y_triton = triton_softmax(X, scale=scale)
             assert torch.allclose(Y_torch_native, Y_torch, atol=1e-6), f"Test failure: mismatch for size {size}"
             assert torch.allclose(Y_torch_native, Y_torch_compile, atol=1e-6), f"Test failure: mismatch for size {size}"
             assert torch.allclose(Y_torch_native, Y_triton, atol=1e-6), f"Test failure: mismatch for size {size}"
+
     print("=========================")
     print("=== All tests passed! ===")
     print("=========================")
@@ -152,16 +153,21 @@ def benchmark(size: int, provider: Literal["torch_native", "torch", "torch_compi
     X = torch.rand(size=(size, size), device=DEVICE, dtype=torch.float32)
     scale = 1.0 + (size % 10) * 0.1  # vary scale for each size
     if provider == "torch_native":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_native_softmax(X, scale)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_native_softmax(X, scale=scale)))
     elif provider == "torch":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_softmax(X, scale)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_softmax(X, scale=scale)))
     elif provider == "torch_compile":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_softmax(X, scale)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_softmax(X, scale=scale)))
     elif provider == "triton":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_softmax(X, scale)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_softmax(X, scale=scale)))
     else:
         raise ValueError(f"Unknown provider: {provider}")
-    return 2 * X.numel() * X.element_size() * 1e-9 / (ms * 1e-3)
+
+    # Compute bytes processed: every element of X is read once, and every element of Y is written once.
+    bytes_processed = 2 * X.numel() * X.element_size()
+
+    # Return bandwidth in GB/s.
+    return bytes_processed * 1e-9 / (ms * 1e-3)
 
 
 def main() -> None:

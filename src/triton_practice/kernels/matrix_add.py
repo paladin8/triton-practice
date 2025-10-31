@@ -194,6 +194,7 @@ def test() -> None:
             assert torch.allclose(C_torch, C_torch_compile), f"Test failure: mismatch for size {size}"
             assert torch.allclose(C_torch, C_triton_2d), f"Test failure: mismatch for size {size}"
             assert torch.allclose(C_torch, C_triton_1d), f"Test failure: mismatch for size {size}"
+
     print("=========================")
     print("=== All tests passed! ===")
     print("=========================")
@@ -225,7 +226,12 @@ def benchmark(size: int, provider: Literal["torch", "torch_compile", "triton_2d"
         ms = cast("float", triton.testing.do_bench(fn=lambda: triton_matrix_add_1d(A, B)))
     else:
         raise ValueError(f"Unknown provider: {provider}")
-    return 3 * A.numel() * A.element_size() * 1e-9 / (ms * 1e-3)
+
+    # Compute bytes processed: every element of A and B is read once, and every element of C is written once.
+    bytes_processed = 3 * A.numel() * A.element_size()
+
+    # Return bandwidth in GB/s.
+    return bytes_processed * 1e-9 / (ms * 1e-3)
 
 
 def main() -> None:
