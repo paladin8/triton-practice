@@ -21,7 +21,7 @@ The RoPE operation does the following to each per-head query/key vector of size 
 
 For simplicity, we assume that the sequence length for all queries and keys is the same (S). Also, we don't worry
 about caching th sin/cos tensors, which you would always want to do in practice. Lastly, the rotations are done on
-a single tensor containing all queries, keys, and values, and they are applied to the input tensor in-place.
+a single tensor containing all queries and keys, and they are applied to the input tensor in-place.
 """
 
 from typing import Literal, cast
@@ -30,27 +30,40 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
-from vllm.vllm_flash_attn.layers.rotary import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 from triton_practice.utils.device import DEVICE
 
 
 def vllm_rope(
-    qkv: torch.Tensor,  # [B, S, 3, H, D] tensor containing queries, keys, and values
+    qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
 ) -> torch.Tensor:
-    D = qkv.shape[-1]
+    B, S, _, _, D = qk.shape
     assert D % 2 == 0, "D must be even"
 
-    rope_embedding = RotaryEmbedding(dim=D, base=b, interleaved=True, device=DEVICE)
-    return cast("torch.Tensor", rope_embedding.forward(qkv=qkv))
+    rope_embedding = RotaryEmbedding(
+        head_size=D,
+        rotary_dim=D,
+        max_position_embeddings=S,
+        base=b,
+        is_neox_style=False,
+        dtype=qk.dtype
+    )
+    rope_embedding.forward_cuda(
+        positions=torch.arange(0, S).repeat(B),
+        query=qk[:, :, 0, :, :].view(B * S, -1, D),
+        key=qk[:, :, 1, :, :].view(B * S, -1, D),
+    )
+
+    return qk
 
 
 def torch_rope(
-    qkv: torch.Tensor,  # [B, S, 3, H, D] tensor containing queries, keys, and values
+    qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
 ) -> torch.Tensor:
-    _, S, _, _, D = qkv.shape
+    _, S, _, _, D = qk.shape
     assert D % 2 == 0, "D must be even"
 
     # Compute the rotation angles for each (m, 2*d) pair: m * theta_d.
@@ -60,15 +73,12 @@ def torch_rope(
     rotation_angles = torch.matmul(position_ids, thetas)  # [S, D/2] angles
 
     # Compute the rotation sin/cos.
-    sin = torch.sin(rotation_angles).to(dtype=qkv.dtype)  # [S, D/2]
-    cos = torch.cos(rotation_angles).to(dtype=qkv.dtype)  # [S, D/2]
+    sin = torch.sin(rotation_angles).to(dtype=qk.dtype)  # [S, D/2]
+    cos = torch.cos(rotation_angles).to(dtype=qk.dtype)  # [S, D/2]
 
     # Expand the shapes of sin/cos to enable broadcasting.
     sin = sin[None, :, None, None, :]  # [1, S, 1, 1, D/2]
     cos = cos[None, :, None, None, :]  # [1, S, 1, 1, D/2]
-
-    # Extract just the query and key vectors (values do not get rotated).
-    qk = qkv[:, :, 0:2, :, :]  # [B, S, 2, H, D]
 
     # Split qk tensor by the last dimension (hidden vector). qk_0 contains the even indices, and qk_1 the odd ones.
     qk_0 = qk[..., 0::2]  # [B, S, 2, H, D/2]
@@ -84,7 +94,7 @@ def torch_rope(
     qk[..., 0::2] = qk_rot_0
     qk[..., 1::2] = qk_rot_1
 
-    return qkv
+    return qk
 
 
 torch_compile_rope = torch.compile(torch_rope)
@@ -164,10 +174,10 @@ def _triton_rope_kernel(
     S: int,  # sequence length
     H: tl.constexpr,  # number of attention heads
     D_half: tl.constexpr,  # hidden dimension per head (half)
-    stride_qkb: int,  # stride of qkv tensor along the batch size
-    stride_qks: int,  # stride of qkv tensor along the sequence length
-    stride_qkh: int,  # stride of qkv tensor along the attention heads
-    stride_qkd: int,  # stride of qkv tensor along the hidden dimension
+    stride_qkb: int,  # stride of qk tensor along the batch size
+    stride_qks: int,  # stride of qk tensor along the sequence length
+    stride_qkh: int,  # stride of qk tensor along the attention heads
+    stride_qkd: int,  # stride of qk tensor along the hidden dimension
     stride_sins: int,  # stride of sin tensor along the sequence length
     stride_sind: int,  # stride of sin tensor along the hidden dimension
     stride_coss: int,  # stride of cos tensor along the sequence length
@@ -211,18 +221,18 @@ def _triton_rope_kernel(
 
 
 def triton_rope(
-    qkv: torch.Tensor,  # [B, S, 3, H, D] tensor containing queries, keys, and values
+    qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
 ) -> torch.Tensor:
-    B, S, _, H, D = qkv.shape
+    B, S, _, H, D = qk.shape
     assert (H & (H - 1)) == 0, "H must be a power of 2"
     assert (D & (D - 1)) == 0, "D must be a power of 2"
     D_half = D // 2
 
     # First, launch a 1-D kernel that computes the sin/cos tensors. There is probably no benefit to writing this as a
     # triton kernel vs using torch directly, but this is for practice.
-    sin = torch.empty(size=(S, D_half), device=DEVICE, dtype=qkv.dtype)
-    cos = torch.empty(size=(S, D_half), device=DEVICE, dtype=qkv.dtype)
+    sin = torch.empty(size=(S, D_half), device=DEVICE, dtype=qk.dtype)
+    cos = torch.empty(size=(S, D_half), device=DEVICE, dtype=qk.dtype)
 
     sin_cos_grid = lambda META: (META["S_STRIDE"],)
     _triton_rope_sin_cos_kernel[sin_cos_grid](
@@ -238,31 +248,29 @@ def triton_rope(
     )
 
     # Next, launch a 2-D kernel that actually applies the rotations.
-    # We first extract just the queries and keys from qkv. And then we reshape to collapse the query/key dimension with
-    # the head dimension, which allows us to write the kernel in a more general way. It also slightly simplifies the
-    # offset computations we need to do inside of the kernel which has a small performance benefit.
-    qk = qkv[:, :, 0:2, :, :].reshape(B, S, 2*H, D)
-    assert qk.data_ptr() == qkv.data_ptr(), "qk must be a view of qkv"
-
+    # We create a view on top of qk to collapse the query/key dimension with the head dimension, which allows us to
+    # write the kernel in a more general way. It also slightly simplifies the offset computations we need to do inside
+    # of the kernel which has a small performance benefit.
+    qk_view = qk.view(B, S, 2 * H, D)
     rope_grid = lambda META: (META["S_STRIDE"], B)
     _triton_rope_kernel[rope_grid](
-        qk_ptr=qk,
+        qk_ptr=qk_view,
         sin_ptr=sin,
         cos_ptr=cos,
         S=S,
         H=2*H,
         D_half=D_half,
-        stride_qkb=qk.stride(0),
-        stride_qks=qk.stride(1),
-        stride_qkh=qk.stride(2),
-        stride_qkd=qk.stride(3),
+        stride_qkb=qk_view.stride(0),
+        stride_qks=qk_view.stride(1),
+        stride_qkh=qk_view.stride(2),
+        stride_qkd=qk_view.stride(3),
         stride_sins=sin.stride(0),
         stride_sind=sin.stride(1),
         stride_coss=cos.stride(0),
         stride_cosd=cos.stride(1),
     )
 
-    return qkv
+    return qk
 
 
 def test() -> None:
@@ -271,11 +279,11 @@ def test() -> None:
     D = 256
     b = 10000
     for S in [16, 64, 256]:
-        qkv = torch.rand(size=(B, S, 3, H, D), device=DEVICE, dtype=torch.float32)
-        rotated_vllm = vllm_rope(qkv.clone(), b=b)
-        rotated_torch = torch_rope(qkv.clone(), b=b)
-        rotated_torch_compile = torch_compile_rope(qkv.clone(), b=b)
-        rotated_triton = triton_rope(qkv.clone(), b=b)
+        qk = torch.rand(size=(B, S, 2, H, D), device=DEVICE, dtype=torch.float32)
+        rotated_vllm = vllm_rope(qk.clone(), b=b)
+        rotated_torch = torch_rope(qk.clone(), b=b)
+        rotated_torch_compile = torch_compile_rope(qk.clone(), b=b)
+        rotated_triton = triton_rope(qk.clone(), b=b)
 
         # We use a higher tolerance of 1e-4 since the computation is fairly complex and more prone to small
         # numerical differences.
@@ -309,20 +317,20 @@ def benchmark(S: int, provider: Literal["vllm", "torch", "torch_compile", "trito
     H = 16
     D = 256
     b = 10000
-    qkv = torch.rand(size=(B, S, 3, H, D), device=DEVICE, dtype=torch.float32)
+    qk = torch.rand(size=(B, S, 2, H, D), device=DEVICE, dtype=torch.float32)
     if provider == "vllm":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: vllm_rope(qkv, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: vllm_rope(qk, b=b)))
     elif provider == "torch":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_rope(qkv, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_rope(qk, b=b)))
     elif provider == "torch_compile":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_rope(qkv, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_rope(qk, b=b)))
     elif provider == "triton":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_rope(qkv, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_rope(qk, b=b)))
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    # Compute bytes processed: every query/key element of qkv read and written once; values are untouched.
-    bytes_processed = 2 * qkv.numel() * (2 / 3) * qkv.element_size()
+    # Compute bytes processed: every element of qk is read and written once.
+    bytes_processed = 2 * qk.numel() * qk.element_size()
 
     # Return bandwidth in GB/s.
     return bytes_processed * 1e-9 / (ms * 1e-3)
@@ -332,6 +340,9 @@ def main() -> None:
     # Enable Triton autotuning logging.
     import os
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
+    # Set default device to CUDA so all tensors are automatically created there
+    torch.set_default_device(torch.device("cuda"))
 
     # Set reduced precision for float32 matmuls so we can leverage tensor cores.
     torch.set_float32_matmul_precision("high")
@@ -344,20 +355,20 @@ def main() -> None:
     # Run the benchmark.
     benchmark.run(print_data=True)
 
-    # Results on an RTX 5080 (these numbers are high variance).
+    # Results on an RTX 5080.
     #
     # rope-performance:
     #         S        vLLM       Torch  Torch (Compile)      Triton
-    # 0    64.0  395.759061  161.878242       200.745826  383.118596
-    # 1   128.0  582.869182  112.857348       174.267504  363.433328
-    # 2   256.0  624.891514  112.462333       180.832109  427.916248
-    # 3   512.0  729.906735  106.556511       182.638393  453.151756
-    # 4  1024.0  763.896745  112.987397       184.565231  458.228789
+    # 0    64.0  194.108692  157.157113       463.867780  374.122478
+    # 1   128.0  599.260850  113.452334       397.685847  402.239329
+    # 2   256.0  666.883138  108.564224       403.940065  417.559956
+    # 3   512.0  732.738374  114.914446       408.689928  461.132114
+    # 4  1024.0  776.892436  114.871093       409.423457  470.220226
     #
-    # The triton implmeentation is much faster than the torch implementation even with compilation, probably due to the
-    # fact that we don't need to materialize the intermediate rotated results before storing back into qkv (although
-    # it's not clear why torch compilation doesn't fuse this -- maybe complexity from overwriting risk?). It still
-    # falls short of the vLLM implementation, however, which uses its own optimized triton kernel inside.
+    # The triton implmeentation is much faster than the torch implementation and slightly faster than the compiled one,
+    # probably due to the fact that we don't need to materialize the intermediate rotated results before storing back
+    # into qk (although it's not clear why torch compilation doesn't fuse this -- maybe complexity from overwriting
+    # risk?). It still falls short of the vLLM implementation, however, which is done directly in CUDA.
 
 
 if __name__ == "__main__":
