@@ -1,5 +1,8 @@
 """
-Kernels for computing rotary positional embeddings (RoPE) inside an attention layer.
+Kernels for computing RoPE with context extension via YaRN (Yet another RoPE extensioN method).
+See paper for details: https://arxiv.org/pdf/2309.00071
+
+Look at rope.py to see a description of the base RoPE algorithm.
 
 Attention parameters:
 B = batch size
@@ -10,47 +13,79 @@ D = hidden dimension per head
 RoPE parameters:
 b = rotation base
 
-The RoPE operation does the following to each per-head query/key vector of size D (assumed even):
-  1. Interpret each pair of adjacent dimensions as a 2D vector.
-  2. Rotate each 2D vector by an angle that depends on the query/key's position m in the context.
-     The rotation angle is determined by m * theta_d for the pair of indices (2*d, 2*d+1), where:
-        theta_d = b ** (-2 * d / D)
-  3. In practice, this means that x_{2d} and x_{2d+1} are updated as follows:
-        x_{2d}   = x_{2d} * cos(m * theta_d) - x_{2d+1} * sin(m * theta_d)
-        x_{2d+1} = x_{2d} * sin(m * theta_d) + x_{2d+1} * cos(m * theta_d)
+YaRN parameters:
+L = original context length
+s = scaling factor
+alpha = "far" threshold
+beta  = "close" threshold
 
-For simplicity, we assume that the sequence length for all queries and keys is the same (S). Also, we don't worry
-about caching th sin/cos tensors, which you would always want to do in practice. Lastly, the rotations are done on
-a single tensor containing all queries and keys, and they are applied to the input tensor in-place.
+YaRN modifies base RoPE as follows.
+  1. The base RoPE angle in the sequence and dimensions {2*d, 2*d+1} is:
+        theta_d = b ** (-2 * d / D)
+  2. Suppose we want to increase the context length from its original trained value by a factor of s. Then we can
+     imagine an interpolated rotation angle of:
+        phi_d = theta_d / s
+     which simply slows down the rotations by a factor of s so that the extended context length covers the same range
+     of angles as the original context length.
+  3. It turns out that for low values of d, you want to use an angle closer to theta_d, while for high values of d,
+     you want to use an angle closer to phi_d. The theory is that "close" tokens should influence in the same way even
+     after extending the context length, while "far" tokens should have their influence normalized relative to the
+     context length.
+
+     Define the quantity r(d) by: r(d) = (L / (2 * pi)) * theta_d
+     The final rotation angle f(d) is determined piecewise by:
+        r(d) > beta            =>  f(d) = theta_d
+        r(d) < alpha           =>  f(d) = phi_d
+        alpha <= r(d) <= beta  =>  f(d) = (theta_d * (r(d) - alpha) + phi_d * (beta - r(d)) / (beta - alpha)
+     i.e. theta_d for high r(d), phi_d for low r(d), and a linear interpolation of the two in between.
+  4. Finally, we apply a "length scaling" trick to balance the fact that the attention dot products are computed over
+     longer sequences. We do this by multiplying the rotated queries and keys by a factor of 0.1 * log(s) + 1.
+
+Although the paper defines f(d) as above, all implementations I could find use a slightly different formula. According
+to those implementations, step 3 should instead be as follows.
+   3. Let r' be the inverse of r and define: alpha' = ceil(r'(alpha)), beta' = floor(r'(beta)). Then f(d) is:
+         d < beta'             =>  f(d) = theta_d
+         d > alpha'            =>  f(d) = phi_d
+         alpha' <= d <= beta'  =>  f(d) = (theta_d * (alpha' - d) + phi_d * (d - beta')) / (alpha' - beta')
+      which is a similar idea but interpolated differently (because r/r' are not linear).
 """
 
+import math
 from typing import Literal, cast
 
 import torch
 import triton
 import triton.language as tl
 import triton.testing
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import YaRNScalingRotaryEmbedding
 
 from triton_practice.utils.device import DEVICE
 
 
-def vllm_rope(
+def vllm_yarn(
     qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
+    L: int,  # original context length
+    s: float,  # scaling factor
+    alpha: int,  # "far" threshold
+    beta: int,   # "close" threshold
 ) -> torch.Tensor:
     B, S, _, _, D = qk.shape
     assert D % 2 == 0, "D must be even"
+    assert beta >= alpha, "Close threshold must be at least as high as far threshold"
 
-    rope_embedding = RotaryEmbedding(
+    yarn_embedding = YaRNScalingRotaryEmbedding(
         head_size=D,
         rotary_dim=D,
-        max_position_embeddings=S,
+        max_position_embeddings=L,
         base=b,
         is_neox_style=False,  # interleaved rotations
-        dtype=qk.dtype
+        scaling_factor=s,
+        dtype=qk.dtype,
+        beta_slow=alpha,
+        beta_fast=beta,
     )
-    rope_embedding.forward_cuda(
+    yarn_embedding.forward_cuda(
         positions=torch.arange(0, S).repeat(B),
         query=qk[:, :, 0, :, :].view(B * S, -1, D),
         key=qk[:, :, 1, :, :].view(B * S, -1, D),
@@ -59,18 +94,55 @@ def vllm_rope(
     return qk
 
 
-def torch_rope(
+def _invert_r(alpha: float, beta: float, D: int, b: float, L: int) -> tuple[float, float]:
+    alpha_p = min(D-1, math.ceil((D / 2) * math.log(L / (2 * math.pi * alpha)) / math.log(b)))
+    beta_p = max(0, math.floor((D / 2) * math.log(L / (2 * math.pi * beta)) / math.log(b)))
+
+    # This version is what I would do to bound alpha_p/beta_p relative to each other.
+    # if alpha <= beta_p:
+    #     alpha_p = beta_p + 0.001
+
+    # This version matches the vLLM implementation. In practice, this is an edge case that probably doesn't affect
+    # performance given a real LLM's model parameters.
+    if alpha_p == beta_p:
+        alpha_p += 0.001
+
+    return alpha_p, beta_p
+
+
+def torch_yarn(
     qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
+    L: int,  # original context length
+    s: float,  # scaling factor
+    alpha: int,  # "far" threshold
+    beta: int,   # "close" threshold
 ) -> torch.Tensor:
     _, S, _, _, D = qk.shape
     assert D % 2 == 0, "D must be even"
+    assert beta >= alpha, "Close threshold must be at least as high as far threshold"
 
-    # Compute the rotation angles for each (m, 2*d) pair: m * theta_d.
+    # Compute the theta_d and phi_d angles.
+    dimensions = torch.arange(D//2, device=DEVICE, dtype=torch.float32)  # [D/2] indices
+    thetas = b ** (-2 * dimensions / D)  # [D/2] angles
+    phis = thetas / s  # [D/2] angles
+
+    # This version is my interpretation of the YaRN paper.
+    # Compute r(d) and use a clamped linear interpolation to compute f(d).
+    # r = (L / (2 * math.pi)) * theta  # [D/2]
+    # interp = torch.clamp((r - alpha) / (beta - alpha), min=0, max=1)  # [D/2] interpolation factor
+    # f = interp * theta + (1 - interp) * phi  # [D/2] angles
+
+    # This version matches the implementations of YaRN I could find (including the official repository).
+    # First compute alpha' and beta' by inverting r, bounding them in an appropriate range. Then interpolate f between
+    # theta and phi per the equation above.
+    alpha_p, beta_p = _invert_r(alpha=alpha, beta=beta, D=D, b=b, L=L)
+    interp = torch.clamp((alpha_p - dimensions) / (alpha_p - beta_p), min=0, max=1)  # [D/2] interpolation factor
+    f = interp * thetas + (1 - interp) * phis  # [D/2] angles
+
+    # Compute the rotation angles.
     position_ids = torch.arange(S, device=DEVICE, dtype=torch.float32)[:, None]  # [S, 1] indices
-    dimensions = torch.arange(D//2, device=DEVICE, dtype=torch.float32)[None, :]  # [1, D/2] indices
-    thetas = b ** (-2 * dimensions / D)  # [1, D/2] angles
-    rotation_angles = torch.matmul(position_ids, thetas)  # [S, D/2] angles
+    rotation_angles = torch.matmul(position_ids, f[None, :])  # [S, D/2] angles
 
     # Compute the rotation sin/cos.
     sin = torch.sin(rotation_angles).to(dtype=qk.dtype)  # [S, D/2]
@@ -90,14 +162,15 @@ def torch_rope(
     qk_rot_0 = qk_0 * cos - qk_1 * sin  # [B, S, 2, H, D/2]
     qk_rot_1 = qk_0 * sin + qk_1 * cos  # [B, S, 2, H, D/2]
 
-    # Store results back into the qk tensor.
-    qk[..., 0::2] = qk_rot_0
-    qk[..., 1::2] = qk_rot_1
+    # Apply length scaling and store results back into the qk tensor.
+    length_scale = 0.1 * math.log(s) + 1
+    qk[..., 0::2] = qk_rot_0 * length_scale
+    qk[..., 1::2] = qk_rot_1 * length_scale
 
     return qk
 
 
-torch_compile_rope = torch.compile(torch_rope)
+torch_compile_yarn = torch.compile(torch_yarn)
 
 
 # Each run of this kernel is responsible for a stride of rows in the output.
@@ -121,6 +194,10 @@ def _triton_rope_sin_cos_kernel(
     S: int,  # sequence length
     D_half: tl.constexpr,  # hidden dimension per head (half)
     b: float,  # rotation base
+    L: int,  # original context length
+    s: float,  # scaling factor
+    alpha_p: int,  # inverted "far" threshold
+    beta_p: int,   # inverted "close" threshold
     stride_sins: int,  # stride of sin tensor along the sequence length
     stride_sind: int,  # stride of sin tensor along the hidden dimension
     stride_coss: int,  # stride of cos tensor along the sequence length
@@ -135,10 +212,13 @@ def _triton_rope_sin_cos_kernel(
     for m in range(pid_s, S, S_STRIDE):
         # Note that we omit masking here because we assume D is always a power of 2.
         offsets_d = tl.arange(0, D_half)  # offsets along the hidden dimension
-
-        # Compute the rotation angles for this row m and all d offsets.
         thetas = tl.exp(-tl.log(b) * offsets_d / D_half)  # [D/2] angles
-        rotation_angles = m * thetas  # [D/2] angles
+        phis = thetas / s  # [D/2] angles
+
+        # Interpolate f between theta and phi per the equation above and multiply by m to get the rotation angles.
+        interp = tl.clamp((alpha_p - offsets_d) / (alpha_p - beta_p), min=0, max=1)  # [D/2] interpolation factor
+        f = interp * thetas + (1 - interp) * phis  # [D/2] angles
+        rotation_angles = m * f  # [D/2] angles
 
         # Compute sin and cos tiles.
         sin_tile = tl.sin(rotation_angles)  # [D/2] tile
@@ -167,13 +247,14 @@ def _triton_rope_sin_cos_kernel(
     restore_value=["qk_ptr"],  # Need to restore this when evaluating autotune configs because we update in-place.
 )
 @triton.jit
-def _triton_rope_kernel(
+def _triton_yarn_kernel(
     qk_ptr: tl.pointer_type,  # [B, S, H, D] input/output tensor
     sin_ptr: tl.pointer_type,  # [S, D/2] sin tensor
     cos_ptr: tl.pointer_type,  # [S, D/2] cos tensor
     S: int,  # sequence length
     H: tl.constexpr,  # number of attention heads
     D_half: tl.constexpr,  # hidden dimension per head (half)
+    s: float,  # scale factor
     stride_qkb: int,  # stride of qk tensor along the batch size
     stride_qks: int,  # stride of qk tensor along the sequence length
     stride_qkh: int,  # stride of qk tensor along the attention heads
@@ -215,24 +296,33 @@ def _triton_rope_kernel(
         qk_rot_0_tile = qk_0_tile * cos_tile[None, :] - qk_1_tile * sin_tile[None, :]  # [H, D/2] even tile
         qk_rot_1_tile = qk_0_tile * sin_tile[None, :] + qk_1_tile * cos_tile[None, :]  # [H, D/2] odd tile
 
-        # Join the rotated tiles together and store the result back into the qk tensor.
+        # Join the rotated tiles together, apply length scaling, and store the result back into the qk tensor.
         qk_rot_tile = tl.join(qk_rot_0_tile, qk_rot_1_tile).reshape(H, 2 * D_half)
-        tl.store(qk_ptr + qk_offsets, qk_rot_tile)
+        length_scale = 0.1 * tl.log(s) + 1
+        tl.store(qk_ptr + qk_offsets, qk_rot_tile * length_scale)
 
 
-def triton_rope(
+def triton_yarn(
     qk: torch.Tensor,  # [B, S, 2, H, D] tensor containing queries and keys
     b: float,  # rotation base
+    L: int,  # original context length
+    s: float,  # scaling factor
+    alpha: int,  # "far" threshold
+    beta: int,   # "close" threshold
 ) -> torch.Tensor:
     B, S, _, H, D = qk.shape
     assert (H & (H - 1)) == 0, "H must be a power of 2"
     assert (D & (D - 1)) == 0, "D must be a power of 2"
+    assert beta >= alpha, "Close threshold must be at least as high as far threshold"
     D_half = D // 2
 
     # First, launch a 1-D kernel that computes the sin/cos tensors. There is probably no benefit to writing this as a
     # triton kernel vs using torch directly, but this is for practice.
     sin = torch.empty(size=(S, D_half), device=DEVICE, dtype=qk.dtype)
     cos = torch.empty(size=(S, D_half), device=DEVICE, dtype=qk.dtype)
+
+    # Compute alpha' and beta' outside of the triton kernel since it cannot access global functions.
+    alpha_p, beta_p = _invert_r(alpha=alpha, beta=beta, D=D, b=b, L=L)
 
     sin_cos_grid = lambda META: (META["S_STRIDE"],)
     _triton_rope_sin_cos_kernel[sin_cos_grid](
@@ -241,6 +331,10 @@ def triton_rope(
         S=S,
         D_half=D_half,
         b=b,
+        L=L,
+        s=s,
+        alpha_p=alpha_p,
+        beta_p=beta_p,
         stride_sins=sin.stride(0),
         stride_sind=sin.stride(1),
         stride_coss=cos.stride(0),
@@ -254,13 +348,14 @@ def triton_rope(
     qk_view = qk.view(B, S, 2 * H, D)
 
     rope_grid = lambda META: (META["S_STRIDE"], B)
-    _triton_rope_kernel[rope_grid](
+    _triton_yarn_kernel[rope_grid](
         qk_ptr=qk_view,
         sin_ptr=sin,
         cos_ptr=cos,
         S=S,
         H=2*H,
         D_half=D_half,
+        s=s,
         stride_qkb=qk_view.stride(0),
         stride_qks=qk_view.stride(1),
         stride_qkh=qk_view.stride(2),
@@ -279,12 +374,16 @@ def test() -> None:
     H = 16
     D = 256
     b = 10000
+    s = 4
+    alpha = 1
+    beta = 32
     for S in [16, 64, 256]:
+        L = S // s
         qk = torch.rand(size=(B, S, 2, H, D), device=DEVICE, dtype=torch.float32)
-        rotated_vllm = vllm_rope(qk.clone(), b=b)
-        rotated_torch = torch_rope(qk.clone(), b=b)
-        rotated_torch_compile = torch_compile_rope(qk.clone(), b=b)
-        rotated_triton = triton_rope(qk.clone(), b=b)
+        rotated_vllm = vllm_yarn(qk.clone(), b=b, L=L, s=s, alpha=alpha, beta=beta)
+        rotated_torch = torch_yarn(qk.clone(), b=b, L=L, s=s, alpha=alpha, beta=beta)
+        rotated_torch_compile = torch_compile_yarn(qk.clone(), b=b, L=L, s=s, alpha=alpha, beta=beta)
+        rotated_triton = triton_yarn(qk.clone(), b=b, L=L, s=s, alpha=alpha, beta=beta)
 
         # We use a higher tolerance of 1e-4 since the computation is fairly complex and more prone to small
         # numerical differences.
@@ -309,7 +408,7 @@ def test() -> None:
         line_vals=["vllm", "torch", "torch_compile", "triton"],  # Possible values for `line_arg`.
         line_names=["vLLM", "Torch", "Torch (Compile)", "Triton"],  # Label name for the lines.
         ylabel="GB/s",  # Label name for the y-axis.
-        plot_name="rope-performance",  # Name for the plot. Used also as a file name for saving the plot.
+        plot_name="yarn-performance",  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ),
 )
@@ -318,15 +417,22 @@ def benchmark(S: int, provider: Literal["vllm", "torch", "torch_compile", "trito
     H = 16
     D = 256
     b = 10000
+    L = S // 4
+    s = S / L
+    alpha = 1
+    beta = 32
     qk = torch.rand(size=(B, S, 2, H, D), device=DEVICE, dtype=torch.float32)
     if provider == "vllm":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: vllm_rope(qk, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: vllm_yarn(qk, b=b, L=L, s=s, alpha=alpha, beta=beta)))
     elif provider == "torch":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_rope(qk, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_yarn(qk, b=b, L=L, s=s, alpha=alpha, beta=beta)))
     elif provider == "torch_compile":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: torch_compile_rope(qk, b=b)))
+        ms = cast(
+            "float",
+            triton.testing.do_bench(fn=lambda: torch_compile_yarn(qk, b=b, L=L, s=s, alpha=alpha, beta=beta))
+        )
     elif provider == "triton":
-        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_rope(qk, b=b)))
+        ms = cast("float", triton.testing.do_bench(fn=lambda: triton_yarn(qk, b=b, L=L, s=s, alpha=alpha, beta=beta)))
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -348,7 +454,7 @@ def main() -> None:
     # Set reduced precision for float32 matmuls so we can leverage tensor cores.
     torch.set_float32_matmul_precision("high")
 
-    print("Running RoPE benchmark on device:", DEVICE)
+    print("Running YaRN benchmark on device:", DEVICE)
 
     # Run a simple correctness test first.
     test()
@@ -358,18 +464,15 @@ def main() -> None:
 
     # Results on an RTX 5080.
     #
-    # rope-performance:
+    # yarn-performance:
     #         S        vLLM       Torch  Torch (Compile)      Triton
-    # 0    64.0  194.108692  157.157113       463.867780  374.122478
-    # 1   128.0  599.260850  113.452334       397.685847  402.239329
-    # 2   256.0  666.883138  108.564224       403.940065  417.559956
-    # 3   512.0  732.738374  114.914446       408.689928  461.132114
-    # 4  1024.0  776.892436  114.871093       409.423457  470.220226
+    # 0    64.0  307.695798  125.727618       483.748836  359.179331
+    # 1   128.0  374.860524   88.472728       358.168273  396.326726
+    # 2   256.0  538.861953   97.968358       405.979829  405.053464
+    # 3   512.0  674.876659   99.372010       408.636860  435.806163
+    # 4  1024.0  739.068983  100.029236       406.845851  448.267167
     #
-    # The triton implmeentation is much faster than the torch implementation and slightly faster than the compiled one,
-    # probably due to the fact that we don't need to materialize the intermediate rotated results before storing back
-    # into qk (although it's not clear why torch compilation doesn't fuse this -- maybe complexity from overwriting
-    # risk?). It still falls short of the vLLM implementation, however, which is done directly in CUDA.
+    # Basically the same performance characteristics as regular RoPE.
 
 
 if __name__ == "__main__":
