@@ -151,7 +151,7 @@ def _triton_rope_sin_cos_kernel(
         tl.store(cos_ptr + cos_offsets, cos_tile)
 
 
-# Each run of this kernel is responsible for one batch and a stride of sequence length in qk.
+# Each run of this kernel is responsible for one input and a stride of sequence length in qk.
 @triton.autotune(
     configs=[
         # Multiple configurations for triton to choose from. Triton will benchmark these and pick the best one.
