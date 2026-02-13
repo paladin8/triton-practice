@@ -200,10 +200,27 @@ torch_compile_flash_attention = torch.compile(torch_flash_attention)
         # Stages (typically 2-4): more stages allow for more overlapping of memory traffic with compute, but at the cost
         # of more SHMEM/register usage.
         # Warps (typically 2, 4, 8): more warps can increase occupancy, but at the cost of more SHMEM/register usage.
-        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_stages=1, num_warps=4),
-        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_stages=1, num_warps=4),
-        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_stages=1, num_warps=4),
-        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 128}, num_stages=1, num_warps=4),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 32}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 32}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 256}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 256}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 128}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 128}, num_stages=4, num_warps=8),
     ],
     key=["S", "D"],
 )
@@ -290,7 +307,7 @@ def _triton_flash_attention_kernel(
         P *= qk_scale
 
         # Apply causal mask when when necessary.
-        if kv_start + BLOCK_KV >= q_start:
+        if kv_start + BLOCK_KV > q_start:
             kv_indices = kv_start + tl.arange(0, BLOCK_KV)  # [BLOCK_KV] offsets
             mask = q_indices[:, None] >= kv_indices[None, :]  # [BLOCK_Q, BLOCK_KV] mask
             P = tl.where(mask, P, float("-inf"))
@@ -504,16 +521,16 @@ def main() -> None:
     #
     # flash-attention-performance:
     #         S        vLLM      Torch  Torch (Compile)      Triton
-    # 0   256.0  290.594383  18.899256        55.626485  114.792367
-    # 1   512.0  269.460296  13.770371        44.777605   92.884442
-    # 2  1024.0  186.331160   8.849901        31.512265   71.069269
-    # 3  2048.0  112.127308   5.169715        19.390696   46.505103
-    # 4  4096.0   61.018511   2.822685        10.357715   27.181299
+    # 0   256.0  278.524175  17.625972        54.090484  110.860987
+    # 1   512.0  253.212982  12.977251        43.802289  109.723597
+    # 2  1024.0  183.238574   8.245328        30.781891   86.119837
+    # 3  2048.0  106.444281   4.879752        19.377014   57.299109
+    # 4  4096.0   57.338884   2.626498        10.570307   33.966939
     #
     # Both the torch and torch compiled implementations are quite slow here, as they have a harder time taking
     # advantage of the design of flash attention (+ I didn't spend time optimizing them). While the triton
-    # implementation is much faster than torch, despite my best efforts to optimize it, it is still 2-3x slower than
-    # the vLLM implementation.
+    # implementation is much faster than torch, despite my best efforts to optimize it, it is still ~2x slower than
+    # the vLLM implementation (which is a heavily-optimized CUDA kernel).
 
 
 if __name__ == "__main__":
